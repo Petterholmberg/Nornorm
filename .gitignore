@@ -2,4 +2,4 @@
 __pycache__/
 *.pyc
 
-/service_account.json
+/service-account.json
