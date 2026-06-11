@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 /env
 /service-account.json
+
+# SQLite (main file + WAL/SHM/journal sidecars + manual backups)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.bak.*
+

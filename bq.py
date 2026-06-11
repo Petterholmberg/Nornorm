@@ -5,10 +5,13 @@ import os
 import time
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import HTTPException
 from google.api_core import exceptions as gax_exceptions
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
