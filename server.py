@@ -114,11 +114,23 @@ _HTML = """<!DOCTYPE html>
     let currentRaw = null;
     let currentSort = null;
 
+    const currencyKeywords = /mrr|arr|revenue|amount|eur|price|gmv|acv|tcv/i;
+
+    function formatCell(col, val) {
+      if (val === null || val === undefined || val === '') return '';
+      const num = typeof val === 'number' ? val : (String(val).trim() !== '' ? Number(val) : NaN);
+      if (!isNaN(num) && String(val).trim() !== '') {
+        const formatted = Math.round(num).toLocaleString('sv-SE');
+        return currencyKeywords.test(col) ? '€' + formatted : formatted;
+      }
+      return val;
+    }
+
     function renderTable(raw) {
       const cols = raw.columns.map(c => c.name);
       const rows = currentSort ? [...raw.rows].sort((a, b) => (parseFloat(b[currentSort]) || 0) - (parseFloat(a[currentSort]) || 0)) : raw.rows;
       const header = '<tr>' + cols.map(c => `<th>${c.replace(/_/g, ' ')} <button onclick="currentSort='${c}'; renderTable(currentRaw)" style="font-size:10px;padding:2px 6px;cursor:pointer;border:none;background:#0071e3;color:#fff;border-radius:4px;">↕</button></th>`).join('') + '</tr>';
-      const body = rows.map(r => '<tr>' + cols.map(c => `<td>${r[c]}</td>`).join('') + '</tr>').join('');
+      const body = rows.map(r => '<tr>' + cols.map(c => `<td>${formatCell(c, r[c])}</td>`).join('') + '</tr>').join('');
       document.getElementById('table-panel').innerHTML = `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
     }
 
@@ -268,6 +280,17 @@ def load_schema():
     text += "\nKPI calculation rules (follow these exactly when writing SQL):\n"
     for metric, calculation in kpis:
         text += f"\n{metric}:\n  {calculation}\n"
+
+    conn3 = sqlite3.connect("insights.db")
+    cursor3 = conn3.cursor()
+    cursor3.execute("SELECT name, description FROM concepts")
+    concepts = cursor3.fetchall()
+    conn3.close()
+
+    if concepts:
+        text += "\nBusiness concept definitions:\n"
+        for name, description in concepts:
+            text += f"\n{name}: {description}\n"
 
     return text
 
