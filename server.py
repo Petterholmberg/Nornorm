@@ -40,9 +40,6 @@ BQ_TOOLS = [
 
 load_dotenv()
 
-print("Synkar data från Google Sheets...")
-sync_to_sqlite()
-
 app = FastAPI()
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
@@ -123,7 +120,9 @@ _HTML = """<!DOCTYPE html>
     .msg.assistant pre code { background: none; padding: 0; }
     .msg.assistant a { color: var(--shade-2); }
 
+    .thinking { display: flex; align-items: center; gap: 8px; }
     .thinking .dots { display: inline-flex; gap: 4px; align-items: center; height: 20px; }
+    .thinking-text { font-size: 13px; color: var(--shade-4); }
     .thinking .dots span { width: 6px; height: 6px; border-radius: 9999px; background: var(--shade-4); animation: blink 1.2s infinite both; }
     .thinking .dots span:nth-child(2) { animation-delay: .2s; }
     .thinking .dots span:nth-child(3) { animation-delay: .4s; }
@@ -202,7 +201,13 @@ _HTML = """<!DOCTYPE html>
         <div class="page-eyebrow">Workspace</div>
         <h1 class="page-title">Data Chat</h1>
       </div>
-      <span class="pill"><span class="pill-dot"></span>Powered by Claude</span>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button id="sync-btn" onclick="syncSheets()" style="display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:4px;font-size:13px;font-weight:500;color:var(--shade-3);background:transparent;border:1px solid var(--sand-3);cursor:pointer;transition:background .15s,color .15s;" onmouseover="this.style.background='var(--sand-3)';this.style.color='var(--shade-1)'" onmouseout="this.style.background='transparent';this.style.color='var(--shade-3)'">
+          <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          Sync Sheets
+        </button>
+        <span class="pill"><span class="pill-dot"></span>Powered by Claude</span>
+      </div>
     </div>
 
     <div class="content">
@@ -248,6 +253,20 @@ _HTML = """<!DOCTYPE html>
   </main>
 
   <script>
+    async function syncSheets() {
+      const btn = document.getElementById('sync-btn');
+      btn.disabled = true;
+      btn.textContent = 'Syncing...';
+      try {
+        await fetch('/sync', { method: 'POST' });
+        btn.textContent = 'Synced!';
+        setTimeout(() => { btn.innerHTML = '<svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg> Sync Sheets'; btn.disabled = false; }, 2000);
+      } catch {
+        btn.textContent = 'Failed';
+        setTimeout(() => { btn.innerHTML = '<svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg> Sync Sheets'; btn.disabled = false; }, 2000);
+      }
+    }
+
     const messagesEl = document.getElementById('messages');
     const inputEl = document.getElementById('input');
     const sendBtn = document.getElementById('send');
@@ -309,7 +328,7 @@ _HTML = """<!DOCTYPE html>
       addMessage('user', text);
       const assistantDiv = addMessage('assistant', '');
       assistantDiv.classList.add('thinking');
-      assistantDiv.innerHTML = '<span class="dots"><span></span><span></span><span></span></span>';
+      assistantDiv.innerHTML = '<span class="dots"><span></span><span></span><span></span></span><span class="thinking-text"></span>';
       resetSql();
 
       const res = await fetch('/chat', {
@@ -334,6 +353,12 @@ _HTML = """<!DOCTYPE html>
           const data = line.slice(6);
           if (data === '[DONE]') break;
           const parsed = JSON.parse(data);
+          if (typeof parsed === 'object' && parsed.type === 'thinking') {
+            assistantDiv.classList.add('thinking');
+            assistantDiv.innerHTML = '<span class="dots"><span></span><span></span><span></span></span><span class="thinking-text">' + parsed.text.replace(/</g, '&lt;') + '</span>';
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            continue;
+          }
           if (typeof parsed === 'object' && parsed.type === 'table') {
             currentRaw = parsed.data;
             currentSort = null;
@@ -384,6 +409,12 @@ class ChatRequest(BaseModel):
 @app.get("/")
 def index() -> HTMLResponse:
     return HTMLResponse(_HTML)
+
+
+@app.post("/sync")
+def sync():
+    sync_to_sqlite()
+    return {"status": "ok"}
 
 
 def execute_sqlite_query(sql: str) -> dict:
@@ -475,6 +506,7 @@ SYSTEM_PROMPT = (
 You are a data analyst for Nornorm helping users retrieve data from BigQuery.
 When the user asks for data, generate a SQL query and run it using the run_sql tool.
 Respond very briefly in the chat, just one sentence. Do NOT show the table in the chat — data is automatically shown in the table panel below.
+CRITICAL: Never narrate your process. Never write sentences like "I'll calculate...", "Let me check...", "I will now run a query...", "Let me first...", or any other description of what you are about to do. Run all queries silently and only output one final sentence with the result.
 
 When the user asks about KPIs, metrics or explanations, use the run_sqlite_sql tool against the table kpi_documentation.
 The table has columns: metric_kpi, short_explanation, data_explanation, columns_used, filters_used, calculation, note, category.
@@ -505,15 +537,22 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 messages=messages,
             )
 
+            has_thinking_text = False
             for block in response.content:
-                if block.type == "text":
-                    yield f"data: {json.dumps(block.text)}\n\n"
+                if block.type == "text" and block.text.strip():
+                    if response.stop_reason == "tool_use":
+                        yield f"data: {json.dumps({'type': 'thinking', 'text': block.text})}\n\n"
+                        has_thinking_text = True
+                    else:
+                        yield f"data: {json.dumps(block.text)}\n\n"
 
             if response.stop_reason != "tool_use":
                 break
 
             tool_use_block = next(b for b in response.content if b.type == "tool_use")
             sql = tool_use_block.input["sql"]
+            if not has_thinking_text:
+                yield f"data: {json.dumps({'type': 'thinking', 'text': 'Searching...'})}\n\n"
 
             if tool_use_block.name == "run_sqlite_sql":
                 try:
@@ -523,7 +562,6 @@ def chat(req: ChatRequest) -> StreamingResponse:
                     tool_result_content = json.dumps({"error": str(exc)})
             else:
                 yield f"data: {json.dumps({'type': 'sql', 'data': sql})}\n\n"
-                yield f"data: {json.dumps(chr(10) + chr(10))}\n\n"
                 try:
                     result = apply_aliases(execute_query(sql))
                     tool_result_content = json.dumps(result)
