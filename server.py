@@ -34,10 +34,7 @@ BQ_TOOLS = [
             },
             "required": ["sql"],
         },
-    }
-
-
-
+    },
 ]
 
 load_dotenv()
@@ -219,7 +216,6 @@ def index() -> HTMLResponse:
     return HTMLResponse(_HTML)
 
 
-
 def execute_sqlite_query(sql: str) -> dict:
     conn = sqlite3.connect("insights.db")
     cursor = conn.cursor()
@@ -229,6 +225,7 @@ def execute_sqlite_query(sql: str) -> dict:
     conn.close()
     return {"columns": columns, "rows": rows}
 
+
 def apply_aliases(result: dict) -> dict:
     conn = sqlite3.connect("insights.db")
     cursor = conn.cursor()
@@ -237,19 +234,23 @@ def apply_aliases(result: dict) -> dict:
     conn.close()
 
     result["columns"] = [
-        {"name": alias_map.get(col["name"], col["name"])}
-        for col in result["columns"]
+        {"name": alias_map.get(col["name"], col["name"])} for col in result["columns"]
     ]
     return result
+
 
 def load_schema():
     conn = sqlite3.connect("insights.db")
     cursor = conn.cursor()
 
-    cursor.execute("SELECT source_table, source_column, alias, data_type FROM curated_columns WHERE is_groupable = 1 OR is_aggregatable = 1")
+    cursor.execute(
+        "SELECT source_table, source_column, alias, data_type FROM curated_columns WHERE is_groupable = 1 OR is_aggregatable = 1"
+    )
     columns = cursor.fetchall()
 
-    cursor.execute("SELECT left_table, left_column, right_table, right_column, join_type FROM join_definitions")
+    cursor.execute(
+        "SELECT left_table, left_column, right_table, right_column, join_type FROM join_definitions"
+    )
     joins = cursor.fetchall()
 
     conn.close()
@@ -260,7 +261,6 @@ def load_schema():
             tables[table_name] = []
         tables[table_name].append(f"{column_name} (alias: {alias}, type: {col_type})")
 
-
     text = "Available tables in BigQuery:\n"
     for table, cols in tables.items():
         text += f"\n{table}:\n"
@@ -269,11 +269,15 @@ def load_schema():
 
     text += "\nHow tables are joined:\n"
     for left_table, left_col, right_table, right_col, join_type in joins:
-        text += f"  - {left_table}.{left_col} → {right_table}.{right_col} ({join_type})\n"
+        text += (
+            f"  - {left_table}.{left_col} → {right_table}.{right_col} ({join_type})\n"
+        )
 
     conn2 = sqlite3.connect("insights.db")
     cursor2 = conn2.cursor()
-    cursor2.execute("SELECT metric_kpi, calculation FROM kpi_documentation WHERE calculation IS NOT NULL")
+    cursor2.execute(
+        "SELECT metric_kpi, calculation FROM kpi_documentation WHERE calculation IS NOT NULL"
+    )
     kpis = cursor2.fetchall()
     conn2.close()
 
@@ -294,7 +298,9 @@ def load_schema():
 
     return text
 
-SYSTEM_PROMPT = """CRITICAL: Always respond in the exact same language the user writes in. If the user writes in Swedish, your entire response must be in Swedish. If the user writes in English, your entire response must be in English. Never mix languages. Always translate any database content to match the user's language.
+
+SYSTEM_PROMPT = (
+    """CRITICAL: Always respond in the exact same language the user writes in. If the user writes in Swedish, your entire response must be in Swedish. If the user writes in English, your entire response must be in English. Never mix languages. Always translate any database content to match the user's language.
 
 You are a data analyst for Nornorm helping users retrieve data from BigQuery.
 When the user asks for data, generate a SQL query and run it using the run_sql tool.
@@ -310,7 +316,10 @@ Always run a fresh SQL query for every data request. Never assume data exists or
 Never guess or estimate answers. Only state facts that come directly from a query result.
 If you are unsure how to answer a question or which data to use, be honest and ask the user a follow up question instead of guessing.
 ".
-""" + load_schema()
+"""
+    + load_schema()
+)
+
 
 @app.post("/chat")
 def chat(req: ChatRequest) -> StreamingResponse:
@@ -352,22 +361,20 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 except Exception as exc:
                     tool_result_content = json.dumps({"error": str(exc)})
 
-                
-
-
             messages.append({"role": "assistant", "content": response.content})
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_block.id,
-                        "content": tool_result_content,
-                    }
-                ],
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_block.id,
+                            "content": tool_result_content,
+                        }
+                    ],
+                }
+            )
 
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
-
