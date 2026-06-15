@@ -6,6 +6,7 @@ __pycache__/
 
 # SQLite (main file + WAL/SHM/journal sidecars + manual backups)
 *.db
+!seed.sql
 *.db-wal
 *.db-shm
 *.db-journal
