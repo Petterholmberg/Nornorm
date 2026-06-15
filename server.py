@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bq import execute_query
+from sheets import sync_to_sqlite
 
 import json
 import os
@@ -38,6 +39,9 @@ BQ_TOOLS = [
 ]
 
 load_dotenv()
+
+print("Synkar data från Google Sheets...")
+sync_to_sqlite()
 
 app = FastAPI()
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
