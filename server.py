@@ -6,6 +6,7 @@ from sheets import sync_to_sqlite
 import json
 import os
 import sqlite3
+from datetime import date
 
 import anthropic
 from dotenv import load_dotenv
@@ -370,6 +371,12 @@ _HTML = """<!DOCTYPE html>
             sqlEl.textContent = parsed.data;
             continue;
           }
+          if (typeof parsed === 'object' && parsed.type === 'query_error') {
+            document.getElementById('table-panel').innerHTML = `<div style="padding:14px;color:var(--red);font-size:13px;"><strong>Query failed:</strong> ${parsed.data.replace(/</g, '&lt;')}</div>`;
+            const rc = document.getElementById('row-count');
+            if (rc) rc.textContent = '';
+            continue;
+          }
           reply += parsed;
           assistantDiv.classList.remove('thinking');
           assistantDiv.innerHTML = marked.parse(reply);
@@ -440,6 +447,38 @@ def apply_aliases(result: dict) -> dict:
     return result
 
 
+def _get_block_type(block) -> str:
+    if isinstance(block, dict):
+        return block.get("type", "")
+    return getattr(block, "type", "")
+
+
+def sanitize_messages(msgs: list) -> list:
+    """Remove assistant messages with tool_use that have no matching tool_result."""
+    result = []
+    i = 0
+    while i < len(msgs):
+        msg = msgs[i]
+        content = msg.get("content", "")
+        if msg.get("role") == "assistant" and isinstance(content, list):
+            has_tool_use = any(_get_block_type(b) == "tool_use" for b in content)
+            if has_tool_use:
+                if i + 1 < len(msgs):
+                    next_content = msgs[i + 1].get("content", "")
+                    if isinstance(next_content, list) and any(
+                        _get_block_type(b) == "tool_result" for b in next_content
+                    ):
+                        result.append(msg)
+                        result.append(msgs[i + 1])
+                        i += 2
+                        continue
+                i += 1
+                continue
+        result.append(msg)
+        i += 1
+    return result
+
+
 def load_schema():
     conn = sqlite3.connect("insights.db")
     cursor = conn.cursor()
@@ -477,14 +516,18 @@ def load_schema():
     conn2 = sqlite3.connect("insights.db")
     cursor2 = conn2.cursor()
     cursor2.execute(
-        "SELECT metric_kpi, calculation FROM kpi_documentation WHERE calculation IS NOT NULL"
+        "SELECT metric_kpi, calculation, data_explanation, columns_used FROM kpi_documentation WHERE calculation IS NOT NULL"
     )
     kpis = cursor2.fetchall()
     conn2.close()
 
     text += "\nKPI calculation rules (follow these exactly when writing SQL):\n"
-    for metric, calculation in kpis:
-        text += f"\n{metric}:\n  {calculation}\n"
+    for metric, calculation, data_explanation, columns_used in kpis:
+        text += f"\n{metric}:\n  Calculation: {calculation}\n"
+        if data_explanation:
+            text += f"  Data explanation: {data_explanation}\n"
+        if columns_used:
+            text += f"  Columns used: {columns_used}\n"
 
     conn3 = sqlite3.connect("insights.db")
     cursor3 = conn3.cursor()
@@ -506,7 +549,7 @@ SYSTEM_PROMPT = (
 You are a data analyst for Nornorm helping users retrieve data from BigQuery.
 When the user asks for data, generate a SQL query and run it using the run_sql tool.
 Respond very briefly in the chat, just one sentence. Do NOT show the table in the chat — data is automatically shown in the table panel below.
-CRITICAL: Never narrate your process. Never write sentences like "I'll calculate...", "Let me check...", "I will now run a query...", "Let me first...", or any other description of what you are about to do. Run all queries silently and only output one final sentence with the result.
+Before calling a tool you may write one short sentence describing what you are looking up (e.g. "Looking up installed MRR for whiteboards in 2026..."). This pre-tool text must NEVER contain any number, figure, amount or percentage — only describe what you are about to search for. All numbers must come from the tool result.
 
 When the user asks about KPIs, metrics or explanations, use the run_sqlite_sql tool against the table kpi_documentation.
 The table has columns: metric_kpi, short_explanation, data_explanation, columns_used, filters_used, calculation, note, category.
@@ -515,8 +558,8 @@ The calculation column will roughly explain how you can calculate the KPI:s.
 Always use alias names in SQL queries, e.g. SELECT subscription_id AS "Subscription ID.
 Always round numerical values to the nearest integer in SQL queries using ROUND().
 Always run a fresh SQL query for every data request. Never assume data exists or doesn't exist based on previous queries in the conversation.
-Never guess or estimate answers. Only state facts that come directly from a query result.
-If you are unsure how to answer a question or which data to use, be honest and ask the user a follow up question instead of guessing.
+ABSOLUTE RULE — NO EXCEPTIONS: You are completely forbidden from stating any number, figure, percentage, amount, count or metric unless it is the direct output of a tool call made in THIS conversation. It does not matter if you think you know the answer. It does not matter if you have seen similar data before. You MUST always run a query first and only report what the query returns. If you state a number without a query result to back it up, you are violating your core function. There is no situation where guessing or estimating a number is acceptable.
+If you are unsure how to answer a question or which data to use, ask the user a follow up question instead of guessing.
 ".
 """
     + load_schema()
@@ -529,12 +572,19 @@ def chat(req: ChatRequest) -> StreamingResponse:
 
     def generate():
         while True:
+            clean = sanitize_messages(messages)
+            last_content = clean[-1].get("content", "") if clean else ""
+            already_ran_tool = isinstance(last_content, list) and any(
+                (b.get("type") if isinstance(b, dict) else getattr(b, "type", "")) == "tool_result"
+                for b in last_content
+            )
             response = client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
+                system=SYSTEM_PROMPT + f"\nToday's date is {date.today()}.",
                 tools=BQ_TOOLS,
-                messages=messages,
+                tool_choice={"type": "auto"} if already_ran_tool else {"type": "any"},
+                messages=clean,
             )
 
             has_thinking_text = False
@@ -549,39 +599,42 @@ def chat(req: ChatRequest) -> StreamingResponse:
             if response.stop_reason != "tool_use":
                 break
 
-            tool_use_block = next(b for b in response.content if b.type == "tool_use")
-            sql = tool_use_block.input["sql"]
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
             if not has_thinking_text:
                 yield f"data: {json.dumps({'type': 'thinking', 'text': 'Searching...'})}\n\n"
 
-            if tool_use_block.name == "run_sqlite_sql":
-                try:
-                    result = execute_sqlite_query(sql)
-                    tool_result_content = json.dumps(result)
-                except Exception as exc:
-                    tool_result_content = json.dumps({"error": str(exc)})
-            else:
-                yield f"data: {json.dumps({'type': 'sql', 'data': sql})}\n\n"
-                try:
-                    result = apply_aliases(execute_query(sql))
-                    tool_result_content = json.dumps(result)
-                    yield f"data: {json.dumps({'type': 'table', 'data': result})}\n\n"
-                except Exception as exc:
-                    tool_result_content = json.dumps({"error": str(exc)})
+            tool_results = []
+            for tool_use_block in tool_use_blocks:
+                sql = tool_use_block.input["sql"]
+                if tool_use_block.name == "run_sqlite_sql":
+                    try:
+                        result = execute_sqlite_query(sql)
+                        tool_result_content = json.dumps(result)
+                    except Exception as exc:
+                        tool_result_content = json.dumps({
+                            "error": str(exc),
+                            "CRITICAL_INSTRUCTION": "The query FAILED. You MUST NOT state any number, figure, amount or percentage. You MUST tell the user the query failed and show the error message.",
+                        })
+                else:
+                    yield f"data: {json.dumps({'type': 'sql', 'data': sql})}\n\n"
+                    try:
+                        result = apply_aliases(execute_query(sql))
+                        tool_result_content = json.dumps(result)
+                        yield f"data: {json.dumps({'type': 'table', 'data': result})}\n\n"
+                    except Exception as exc:
+                        yield f"data: {json.dumps({'type': 'query_error', 'data': str(exc)})}\n\n"
+                        tool_result_content = json.dumps({
+                            "error": str(exc),
+                            "CRITICAL_INSTRUCTION": "The query FAILED. You MUST NOT state any number, figure, amount or percentage. You MUST tell the user the query failed and show the error message.",
+                        })
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_block.id,
+                    "content": tool_result_content,
+                })
 
             messages.append({"role": "assistant", "content": response.content})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_block.id,
-                            "content": tool_result_content,
-                        }
-                    ],
-                }
-            )
+            messages.append({"role": "user", "content": tool_results})
 
         yield "data: [DONE]\n\n"
 
