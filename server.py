@@ -17,7 +17,7 @@ from pydantic import BaseModel
 BQ_TOOLS = [
     {
         "name": "run_sql",
-        "description": "Run a SQL query against BigQuery and return the result.",
+        "description": "Query live business data from BigQuery (subscriptions, revenue, licenses, customers, etc.). This is the only source of actual business numbers. Use this AFTER consulting the semantic layer via run_sqlite_sql.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -28,7 +28,7 @@ BQ_TOOLS = [
     },
     {
         "name": "run_sqlite_sql",
-        "description": "Run a SQL query against the local insights.db database containing Excel data about KPIs and metrics.",
+        "description": "Look up KPI definitions, business rules, join logic, and column guidance from the semantic layer (insights.db). This contains NO actual business data — only documentation about how metrics are officially defined at Nornorm. Always call this BEFORE run_sql.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -43,6 +43,9 @@ load_dotenv()
 
 app = FastAPI()
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+
+# Server-side session storage: session_id -> list of messages (including tool_use/tool_result)
+sessions: dict[str, list] = {}
 
 _HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -207,6 +210,7 @@ _HTML = """<!DOCTYPE html>
           <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
           Sync Sheets
         </button>
+        <span id="session-tokens" style="font-size:12px;color:var(--shade-4);">Session: 0 tokens</span>
         <span class="pill"><span class="pill-dot"></span>Powered by Claude</span>
       </div>
     </div>
@@ -272,7 +276,9 @@ _HTML = """<!DOCTYPE html>
     const inputEl = document.getElementById('input');
     const sendBtn = document.getElementById('send');
     const sqlEl = document.getElementById('sql-code');
-    const history = [];
+    const sessionId = crypto.randomUUID();
+    let sessionInputTokens = 0;
+    let sessionOutputTokens = 0;
 
     function clearEmptyState() {
       const e = document.getElementById('empty-state');
@@ -335,7 +341,7 @@ _HTML = """<!DOCTYPE html>
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, history }),
+        body: JSON.stringify({ message: text, session_id: sessionId }),
       });
 
       const reader = res.body.getReader();
@@ -371,10 +377,18 @@ _HTML = """<!DOCTYPE html>
             sqlEl.textContent = parsed.data;
             continue;
           }
-          if (typeof parsed === 'object' && parsed.type === 'query_error') {
-            document.getElementById('table-panel').innerHTML = `<div style="padding:14px;color:var(--red);font-size:13px;"><strong>Query failed:</strong> ${parsed.data.replace(/</g, '&lt;')}</div>`;
-            const rc = document.getElementById('row-count');
-            if (rc) rc.textContent = '';
+          if (typeof parsed === 'object' && parsed.type === 'usage') {
+            sessionInputTokens += parsed.input;
+            sessionOutputTokens += parsed.output;
+            const tokenEl = document.createElement('div');
+            tokenEl.style.cssText = 'font-size:11px;color:var(--shade-4);margin-top:6px;';
+            let tokenText = `${parsed.input + parsed.output} tokens (in: ${parsed.input}, out: ${parsed.output}`;
+            if (parsed.cache_read > 0) tokenText += `, cache read: ${parsed.cache_read}`;
+            if (parsed.cache_creation > 0) tokenText += `, cache created: ${parsed.cache_creation}`;
+            tokenText += ')';
+            tokenEl.textContent = tokenText;
+            assistantDiv.appendChild(tokenEl);
+            document.getElementById('session-tokens').textContent = `Session: ${sessionInputTokens + sessionOutputTokens} tokens`;
             continue;
           }
           reply += parsed;
@@ -389,8 +403,6 @@ _HTML = """<!DOCTYPE html>
         assistantDiv.innerHTML = marked.parse(reply);
       }
 
-      history.push({ role: 'user', content: text });
-      history.push({ role: 'assistant', content: reply });
       sendBtn.disabled = false;
       inputEl.focus();
     }
@@ -410,7 +422,7 @@ _HTML = """<!DOCTYPE html>
 
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict] = []
+    session_id: str
 
 
 @app.get("/")
@@ -551,12 +563,26 @@ When the user asks for data, generate a SQL query and run it using the run_sql t
 Respond very briefly in the chat, just one sentence. Do NOT show the table in the chat — data is automatically shown in the table panel below.
 Before calling a tool you may write one short sentence describing what you are looking up (e.g. "Looking up installed MRR for whiteboards in 2026..."). This pre-tool text must NEVER contain any number, figure, amount or percentage — only describe what you are about to search for. All numbers must come from the tool result.
 
-When the user asks about KPIs, metrics or explanations, use the run_sqlite_sql tool against the table kpi_documentation.
-The table has columns: metric_kpi, short_explanation, data_explanation, columns_used, filters_used, calculation, note, category.
-Category values: Sales Clean Version, Design Clean Version, Marketing Clean Version, Supply Chain Clean Version, Customer & Delivery Performance, Circularity&Quality (WIP).
-The calculation column will roughly explain how you can calculate the KPI:s.
-Always use alias names in SQL queries, e.g. SELECT subscription_id AS "Subscription ID.
+For every data question, follow these steps in order — no exceptions:
+
+1. Interpret the question — understand the metric, time period, filters, and comparison the user wants.
+
+2. Consult the semantic layer FIRST — before writing any SQL, call run_sqlite_sql to look up the official KPI definition, formula, and business rules:
+   SELECT metric_kpi, calculation, columns_used, filters_used, note FROM kpi_documentation WHERE metric_kpi LIKE '%<keyword>%'
+   Also check join rules if the definition references multiple tables:
+   SELECT * FROM join_definitions WHERE table_a LIKE '%<table>%' OR table_b LIKE '%<table>%'
+   Follow the calculation column exactly — it defines the agreed way of measuring things at Nornorm. Never substitute your own logic.
+
+3. Map to the right data source — use BigQuery (run_sql) for live data, insights.db (run_sqlite_sql) for KPI definitions and metadata.
+
+4. Write SQL that respects those definitions — apply the exact filters, joins, aggregations, and column names from the semantic layer. Do not guess column names or join logic.
+
+5. Interpret and summarize the results in plain language — one brief sentence in the chat. The table is shown automatically in the results panel.
+
+The kpi_documentation table has columns: metric_kpi, short_explanation, data_explanation, columns_used, filters_used, calculation, note, category.
+Always use alias names in SQL queries, e.g. SELECT subscription_id AS "Subscription ID".
 Always round numerical values to the nearest integer in SQL queries using ROUND().
+
 Always run a fresh SQL query for every data request. Never assume data exists or doesn't exist based on previous queries in the conversation.
 ABSOLUTE RULE — NO EXCEPTIONS: You are completely forbidden from stating any number, figure, percentage, amount, count or metric unless it is the direct output of a tool call made in THIS conversation. It does not matter if you think you know the answer. It does not matter if you have seen similar data before. You MUST always run a query first and only report what the query returns. If you state a number without a query result to back it up, you are violating your core function. There is no situation where guessing or estimating a number is acceptable.
 If you are unsure how to answer a question or which data to use, ask the user a follow up question instead of guessing.
@@ -566,11 +592,30 @@ If you are unsure how to answer a question or which data to use, ask the user a 
 )
 
 
+def is_data_question(message: str) -> bool:
+    response = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=10,
+        messages=[{
+            "role": "user",
+            "content": f"Is this a data/analytics question that requires querying a database? Reply only 'yes' or 'no'.\n\n{message}",
+        }],
+    )
+    return response.content[0].text.strip().lower() == "yes"
+
+
 @app.post("/chat")
 def chat(req: ChatRequest) -> StreamingResponse:
-    messages = req.history + [{"role": "user", "content": req.message}]
+    if req.session_id not in sessions:
+        sessions[req.session_id] = []
+    messages = sessions[req.session_id]
+    messages.append({"role": "user", "content": req.message})
+
+    data_question = is_data_question(req.message)
 
     def generate():
+        total_input_tokens = 0
+        total_output_tokens = 0
         while True:
             clean = sanitize_messages(messages)
             last_content = clean[-1].get("content", "") if clean else ""
@@ -578,12 +623,22 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 (b.get("type") if isinstance(b, dict) else getattr(b, "type", "")) == "tool_result"
                 for b in last_content
             )
+            if data_question:
+                system = [
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT + f"\nToday's date is {date.today()}.",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            else:
+                system = f"You are a helpful data assistant for Nornorm. Answer conversationally and briefly. Today's date is {date.today()}."
             response = client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=4096,
-                system=SYSTEM_PROMPT + f"\nToday's date is {date.today()}.",
+                system=system,
                 tools=BQ_TOOLS,
-                tool_choice={"type": "auto"} if already_ran_tool else {"type": "any"},
+                tool_choice={"type": "auto"} if (already_ran_tool or not data_question) else {"type": "any"},
                 messages=clean,
             )
 
@@ -596,7 +651,15 @@ def chat(req: ChatRequest) -> StreamingResponse:
                     else:
                         yield f"data: {json.dumps(block.text)}\n\n"
 
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
+            total_input_tokens += getattr(response.usage, "cache_read_input_tokens", 0)
+            total_input_tokens += getattr(response.usage, "cache_creation_input_tokens", 0)
+
             if response.stop_reason != "tool_use":
+                cache_read = getattr(response.usage, "cache_read_input_tokens", 0)
+                cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0)
+                yield f"data: {json.dumps({'type': 'usage', 'input': total_input_tokens, 'output': total_output_tokens, 'cache_read': cache_read, 'cache_creation': cache_creation})}\n\n"
                 break
 
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
@@ -622,7 +685,6 @@ def chat(req: ChatRequest) -> StreamingResponse:
                         tool_result_content = json.dumps(result)
                         yield f"data: {json.dumps({'type': 'table', 'data': result})}\n\n"
                     except Exception as exc:
-                        yield f"data: {json.dumps({'type': 'query_error', 'data': str(exc)})}\n\n"
                         tool_result_content = json.dumps({
                             "error": str(exc),
                             "CRITICAL_INSTRUCTION": "The query FAILED. You MUST NOT state any number, figure, amount or percentage. You MUST tell the user the query failed and show the error message.",
@@ -635,6 +697,14 @@ def chat(req: ChatRequest) -> StreamingResponse:
 
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
+
+        # Save final assistant text response to session
+        final_text = "".join(
+            b.text for b in response.content
+            if getattr(b, "type", "") == "text" and b.text.strip()
+        )
+        if final_text:
+            messages.append({"role": "assistant", "content": final_text})
 
         yield "data: [DONE]\n\n"
 
