@@ -46,6 +46,7 @@ client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
 # Server-side session storage: session_id -> list of messages (including tool_use/tool_result)
 sessions: dict[str, list] = {}
+session_summaries: dict[str, str] = {}
 
 _HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -491,6 +492,97 @@ def sanitize_messages(msgs: list) -> list:
     return result
 
 
+def compress_old_tool_results(msgs: list) -> list:
+    """Replace tool_result content in older turns with a placeholder to save tokens.
+    The most recent tool_result is kept intact so the model has full context for the current question."""
+    last_tool_result_idx = None
+    for i, msg in enumerate(msgs):
+        content = msg.get("content", "")
+        if isinstance(content, list) and any(
+            (b.get("type") if isinstance(b, dict) else getattr(b, "type", "")) == "tool_result"
+            for b in content
+        ):
+            last_tool_result_idx = i
+
+    if last_tool_result_idx is None:
+        return msgs
+
+    result = []
+    for i, msg in enumerate(msgs):
+        content = msg.get("content", "")
+        if (
+            i != last_tool_result_idx
+            and isinstance(content, list)
+            and any(
+                (b.get("type") if isinstance(b, dict) else getattr(b, "type", "")) == "tool_result"
+                for b in content
+            )
+        ):
+            compressed = []
+            for b in content:
+                b_type = b.get("type") if isinstance(b, dict) else getattr(b, "type", "")
+                if b_type == "tool_result":
+                    compressed.append({
+                        "type": "tool_result",
+                        "tool_use_id": b.get("tool_use_id") if isinstance(b, dict) else getattr(b, "tool_use_id", ""),
+                        "content": "[result shown]",
+                    })
+                else:
+                    compressed.append(b)
+            result.append({**msg, "content": compressed})
+        else:
+            result.append(msg)
+    return result
+
+
+def _get_user_turn_indices(messages: list) -> list:
+    return [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    ]
+
+
+def compress_history(session_id: str, messages: list) -> None:
+    """After 10 turns, summarize the oldest turns using Opus and trim them from the session."""
+    user_turns = _get_user_turn_indices(messages)
+    if len(user_turns) <= 10:
+        return
+
+    cutoff_idx = user_turns[-5]
+    old_messages = messages[:cutoff_idx]
+
+    old_text = "\n".join([
+        f"{m['role']}: {m['content'] if isinstance(m['content'], str) else '[tool call/result]'}"
+        for m in old_messages
+    ])
+
+    existing_summary = session_summaries.get(session_id, "")
+    if existing_summary:
+        prompt = f"Previous summary: {existing_summary}\n\nNew turns to add to the summary:\n{old_text}\n\nWrite an updated summary in 3-4 sentences covering what data was requested and what results were found."
+    else:
+        prompt = f"Summarize this conversation in 3-4 sentences, focusing on what data was requested and what results were found:\n\n{old_text}"
+
+    response = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    session_summaries[session_id] = response.content[0].text
+
+    del messages[:cutoff_idx]
+
+
+def get_messages_with_summary(session_id: str, messages: list) -> list:
+    summary = session_summaries.get(session_id)
+    if not summary:
+        return messages
+    return [
+        {"role": "user", "content": f"[Summary of earlier conversation: {summary}]"},
+        {"role": "assistant", "content": "Understood, I have context from the earlier conversation."},
+        *messages,
+    ]
+
+
 def load_schema():
     conn = sqlite3.connect("insights.db")
     cursor = conn.cursor()
@@ -573,9 +665,13 @@ For every data question, follow these steps in order — no exceptions:
    SELECT * FROM join_definitions WHERE table_a LIKE '%<table>%' OR table_b LIKE '%<table>%'
    Follow the calculation column exactly — it defines the agreed way of measuring things at Nornorm. Never substitute your own logic.
 
-3. Map to the right data source — use BigQuery (run_sql) for live data, insights.db (run_sqlite_sql) for KPI definitions and metadata.
+3. Resolve alias names to real BigQuery columns — the kpi_documentation uses business alias names (e.g. "Integrations Amount (Gross)", "Installed Date (PH)"). Before writing BigQuery SQL, look up the real table and column name in curated_columns:
+   SELECT source_table, source_column, alias FROM curated_columns WHERE alias LIKE '%<alias name>%'
+   Always use the source_table and source_column from this lookup in your BigQuery SQL — never guess column names.
 
-4. Write SQL that respects those definitions — apply the exact filters, joins, aggregations, and column names from the semantic layer. Do not guess column names or join logic.
+4. Map to the right data source — use BigQuery (run_sql) for live data, insights.db (run_sqlite_sql) for KPI definitions and metadata.
+
+5. Write SQL that respects those definitions — apply the exact filters, joins, aggregations, and column names from the semantic layer. Do not guess column names or join logic.
 
 5. Interpret and summarize the results in plain language — one brief sentence in the chat. The table is shown automatically in the results panel.
 
@@ -583,7 +679,6 @@ The kpi_documentation table has columns: metric_kpi, short_explanation, data_exp
 Always use alias names in SQL queries, e.g. SELECT subscription_id AS "Subscription ID".
 Always round numerical values to the nearest integer in SQL queries using ROUND().
 
-Always run a fresh SQL query for every data request. Never assume data exists or doesn't exist based on previous queries in the conversation.
 ABSOLUTE RULE — NO EXCEPTIONS: You are completely forbidden from stating any number, figure, percentage, amount, count or metric unless it is the direct output of a tool call made in THIS conversation. It does not matter if you think you know the answer. It does not matter if you have seen similar data before. You MUST always run a query first and only report what the query returns. If you state a number without a query result to back it up, you are violating your core function. There is no situation where guessing or estimating a number is acceptable.
 If you are unsure how to answer a question or which data to use, ask the user a follow up question instead of guessing.
 ".
@@ -610,6 +705,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         sessions[req.session_id] = []
     messages = sessions[req.session_id]
     messages.append({"role": "user", "content": req.message})
+    compress_history(req.session_id, messages)
 
     data_question = is_data_question(req.message)
 
@@ -617,7 +713,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         total_input_tokens = 0
         total_output_tokens = 0
         while True:
-            clean = sanitize_messages(messages)
+            clean = compress_old_tool_results(sanitize_messages(get_messages_with_summary(req.session_id, messages)))
             last_content = clean[-1].get("content", "") if clean else ""
             already_ran_tool = isinstance(last_content, list) and any(
                 (b.get("type") if isinstance(b, dict) else getattr(b, "type", "")) == "tool_result"
